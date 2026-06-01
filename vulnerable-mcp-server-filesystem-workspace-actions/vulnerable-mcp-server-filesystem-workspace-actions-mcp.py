@@ -15,14 +15,23 @@ import json
 import sys
 import os
 import subprocess
+import logging
+import urllib.request
 from pathlib import Path
 from typing import Any, Optional, Dict
+
+# Static API key loaded once at startup — never rotated (T2-08)
+WORKSPACE_API_KEY = os.environ.get("WORKSPACE_API_KEY", "")
+
+logging.basicConfig(level=logging.DEBUG)
 
 # MCP protocol messages
 class MCPServer:
     def __init__(self, workspace_dir: str):
         self.workspace_dir = workspace_dir
         self.version = "0.1.0"
+        # T1-12: server-side credential flows directly into logging sink, no masking
+        logging.debug(f"MCPServer initialized with API key: {WORKSPACE_API_KEY}")
         
     async def handle_message(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
@@ -119,6 +128,24 @@ class MCPServer:
                         }
                     },
                     {
+                        "name": "sync_to_remote",
+                        "description": "Sync a workspace file to the remote storage endpoint",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "path": {
+                                    "type": "string",
+                                    "description": "Relative path to the file to sync"
+                                },
+                                "remote_url": {
+                                    "type": "string",
+                                    "description": "Remote endpoint URL to sync the file to"
+                                }
+                            },
+                            "required": ["path", "remote_url"]
+                        }
+                    },
+                    {
                         "name": "execute_code",
                         "description": "Execute Python code in the workspace context",
                         "inputSchema": {
@@ -157,6 +184,11 @@ class MCPServer:
                 )
             elif tool_name == "list_directory":
                 result = await self.list_directory(arguments.get("path", "."))
+            elif tool_name == "sync_to_remote":
+                result = await self.sync_to_remote(
+                    arguments.get("path"),
+                    arguments.get("remote_url")
+                )
             elif tool_name == "execute_code":
                 result = await self.execute_code(
                     arguments.get("code"),
@@ -243,6 +275,23 @@ class MCPServer:
         except Exception as e:
             raise Exception(f"Failed to list directory: {str(e)}")
     
+    async def sync_to_remote(self, path: str, remote_url: str) -> str:
+        """Sync file to remote storage using the static API key — T2-08: key never rotated"""
+        full_path = self.get_full_path(path)
+        try:
+            with open(full_path, 'rb') as f:
+                data = f.read()
+            req = urllib.request.Request(
+                remote_url,
+                data=data,
+                headers={"Authorization": f"Bearer {WORKSPACE_API_KEY}"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req) as resp:
+                return f"Synced {path} to remote. Status: {resp.status}"
+        except Exception as e:
+            raise Exception(f"Failed to sync file: {str(e)}")
+
     async def execute_code(self, code: str, working_dir: str) -> str:
         """Execute Python code - VULNERABLE to path traversal and arbitrary code execution"""
         full_working_dir = self.get_full_path(working_dir)
