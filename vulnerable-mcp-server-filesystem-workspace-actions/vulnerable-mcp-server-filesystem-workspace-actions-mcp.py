@@ -1,13 +1,8 @@
 #!/usr/bin/env python3
 """
-Vulnerable MCP Server: vulnerable-mcp-server-filesystem-workspace-actions
+MCP Server: vulnerable-mcp-server-filesystem-workspace-actions
 
-WARNING: This server is intentionally vulnerable to path traversal attacks.
-It is designed for security research and education purposes only.
-DO NOT use this in production environments.
-
-The server performs file system operations but has inadequate path validation,
-allowing attackers to escape the workspace directory using path traversal.
+Provides file system operations scoped to a workspace directory.
 """
 
 import asyncio
@@ -22,6 +17,7 @@ from typing import Any, Optional, Dict
 
 # Static API key loaded once at startup — never rotated (T2-08)
 WORKSPACE_API_KEY = os.environ.get("WORKSPACE_API_KEY", "")
+REMOTE_SYNC_URL = os.environ.get("REMOTE_SYNC_URL", "")
 
 logging.basicConfig(level=logging.DEBUG)
 
@@ -129,20 +125,16 @@ class MCPServer:
                     },
                     {
                         "name": "sync_to_remote",
-                        "description": "Sync a workspace file to the remote storage endpoint",
+                        "description": "Sync a workspace file to the configured remote storage endpoint",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
                                 "path": {
                                     "type": "string",
                                     "description": "Relative path to the file to sync"
-                                },
-                                "remote_url": {
-                                    "type": "string",
-                                    "description": "Remote endpoint URL to sync the file to"
                                 }
                             },
-                            "required": ["path", "remote_url"]
+                            "required": ["path"]
                         }
                     },
                     {
@@ -154,11 +146,6 @@ class MCPServer:
                                 "code": {
                                     "type": "string",
                                     "description": "Python code to execute"
-                                },
-                                "working_dir": {
-                                    "type": "string",
-                                    "description": "Working directory for execution (relative to workspace)",
-                                    "default": "."
                                 }
                             },
                             "required": ["code"]
@@ -185,15 +172,9 @@ class MCPServer:
             elif tool_name == "list_directory":
                 result = await self.list_directory(arguments.get("path", "."))
             elif tool_name == "sync_to_remote":
-                result = await self.sync_to_remote(
-                    arguments.get("path"),
-                    arguments.get("remote_url")
-                )
+                result = await self.sync_to_remote(arguments.get("path"))
             elif tool_name == "execute_code":
-                result = await self.execute_code(
-                    arguments.get("code"),
-                    arguments.get("working_dir", ".")
-                )
+                result = await self.execute_code(arguments.get("code"))
             else:
                 return self.error_response(message.get("id"), -32602, f"Unknown tool: {tool_name}")
             
@@ -224,17 +205,15 @@ class MCPServer:
         }
     
     def get_full_path(self, relative_path: str) -> str:
-        """
-        VULNERABILITY: Inadequate path validation allows path traversal
-        This function performs basic path joining but doesn't properly validate
-        that the resulting path stays within the workspace directory.
-        """
-        # Naive path joining - vulnerable to ../../../etc/passwd
-        full_path = os.path.join(self.workspace_dir, relative_path)
-        return full_path
+        """Resolve path safely within workspace boundaries."""
+        workspace = Path(self.workspace_dir).resolve()
+        resolved = (workspace / relative_path).resolve()
+        if not str(resolved).startswith(str(workspace)):
+            raise ValueError(f"Path traversal attempt blocked: {relative_path}")
+        return str(resolved)
     
     async def read_file(self, path: str) -> str:
-        """Read file contents - VULNERABLE to path traversal"""
+        """Read file contents within the workspace"""
         full_path = self.get_full_path(path)
         
         try:
@@ -245,7 +224,7 @@ class MCPServer:
             raise Exception(f"Failed to read file: {str(e)}")
     
     async def write_file(self, path: str, content: str) -> str:
-        """Write file contents - VULNERABLE to path traversal"""
+        """Write file contents within the workspace"""
         full_path = self.get_full_path(path)
         
         try:
@@ -259,7 +238,7 @@ class MCPServer:
             raise Exception(f"Failed to write file: {str(e)}")
     
     async def list_directory(self, path: str) -> str:
-        """List directory contents - VULNERABLE to path traversal"""
+        """List directory contents within the workspace"""
         full_path = self.get_full_path(path)
         
         try:
@@ -275,14 +254,14 @@ class MCPServer:
         except Exception as e:
             raise Exception(f"Failed to list directory: {str(e)}")
     
-    async def sync_to_remote(self, path: str, remote_url: str) -> str:
+    async def sync_to_remote(self, path: str) -> str:
         """Sync file to remote storage using the static API key — T2-08: key never rotated"""
         full_path = self.get_full_path(path)
         try:
             with open(full_path, 'rb') as f:
                 data = f.read()
             req = urllib.request.Request(
-                remote_url,
+                REMOTE_SYNC_URL,
                 data=data,
                 headers={"Authorization": f"Bearer {WORKSPACE_API_KEY}"},
                 method="POST"
@@ -292,15 +271,12 @@ class MCPServer:
         except Exception as e:
             raise Exception(f"Failed to sync file: {str(e)}")
 
-    async def execute_code(self, code: str, working_dir: str) -> str:
-        """Execute Python code - VULNERABLE to path traversal and arbitrary code execution"""
-        full_working_dir = self.get_full_path(working_dir)
-        
+    async def execute_code(self, code: str) -> str:
+        """Execute Python code in the workspace directory"""
         try:
-            # VULNERABILITY: No sandboxing, executes arbitrary code
             process = await asyncio.create_subprocess_exec(
                 sys.executable, '-c', code,
-                cwd=full_working_dir,
+                cwd=self.workspace_dir,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
